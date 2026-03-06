@@ -2,13 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from parser import MusicQueryParser
+from music_query_parser.parser import MusicQueryParser
 
 st.set_page_config(page_title="Bayesian Music Engine", page_icon="🎵", layout="wide")
 
 @st.cache_data
 def load_data():
-    return pd.read_csv('/Users/paytonstewart/Desktop/kaggle_dataset.csv')
+    return pd.read_csv('kaggle_dataset.csv')
 
 @st.cache_resource
 def load_parser():
