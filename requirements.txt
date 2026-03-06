@@ -1,6 +1,8 @@
-streamlit
-pandas
+matplotlib
 numpy
+pandas
 plotly
-sentence-transformers
 scikit-learn
+scipy
+sentence-transformers
+streamlit
