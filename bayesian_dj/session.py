@@ -312,16 +312,17 @@ class DJSession:
             if song_artists_lower & excluded_artists:
                 adjusted -= 0.7
 
+        penalty_scale = 1.0 if len(self.playlist) >= 3 else 0.4
         if prior_score < 0.42:
-            adjusted -= 0.12
+            adjusted -= 0.12 * penalty_scale
         if posterior_score < 0.42:
-            adjusted -= 0.10
+            adjusted -= 0.10 * penalty_scale
         if popularity_score < 0.32:
-            adjusted -= 0.10
+            adjusted -= 0.06
         if discovery_score < -0.08:
-            adjusted -= 0.16
-        if self.playlist and coherence_score < 0.35:
             adjusted -= 0.10
+        if self.playlist and coherence_score < 0.35:
+            adjusted -= 0.08
         if discovery_score > 0.18:
             adjusted += 0.10
         if song.prompt_score > 0.65:
@@ -334,12 +335,13 @@ class DJSession:
             adjusted += 0.04 + 0.05 * direct_match_weight
         elif song.source_type == "history_anchor":
             adjusted -= 0.08 + 0.12 * exploration_weight
+        familiarity_scale = 1.0 if len(self.playlist) >= 2 else 0.3
         if song.is_saved:
-            adjusted -= 0.08 + 0.14 * exploration_weight
+            adjusted -= (0.08 + 0.14 * exploration_weight) * familiarity_scale
         if song.is_recent:
-            adjusted -= 0.08 + 0.12 * exploration_weight
+            adjusted -= (0.08 + 0.12 * exploration_weight) * familiarity_scale
         if song.is_top_track:
-            adjusted -= 0.06 + 0.10 * exploration_weight
+            adjusted -= (0.06 + 0.10 * exploration_weight) * familiarity_scale
 
         song_artists = {
             artist.strip().lower()

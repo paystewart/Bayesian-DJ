@@ -36,10 +36,10 @@ from bayesian_dj.discovery import (
     discovery_score_frame,
     update_beta_bucket,
 )
-from bayesian_dj.prompt_intent import PromptIntent, parse_prompt_intent
+from bayesian_dj.prompt_intent import GENRE_HINTS, MOOD_HINTS, PromptIntent, parse_prompt_intent
 from bayesian_dj.model import BayesianLogisticRegression
 from bayesian_dj.song_pool import AUDIO_FEATURES, SongPool, filter_non_adult_catalog_df
-from music_query_parser.parser import KNOWN_MOODS, MOOD_ALIASES, MusicQueryParser, QuerySpec
+from music_query_parser.parser import KNOWN_GENRES, KNOWN_MOODS, MOOD_ALIASES, MusicQueryParser, QuerySpec
 
 st.set_page_config(
     page_title="Bayesian DJ",
@@ -1400,12 +1400,13 @@ def build_session_from_spec(
         )
 
     if session.pool.n_available > 0:
+        song = None
         if not prior_feedback and session.spec.seed_artists:
-            session.recommend_next(
+            song = session.recommend_next(
                 preferred_artists=session.spec.seed_artists,
                 require_artist_match=True,
             )
-        else:
+        if song is None:
             session.recommend_next()
     return session, taste_note
 
@@ -1541,7 +1542,16 @@ def render_message_html(content: str) -> str:
 def summarize_spec(spec: QuerySpec, session: DJSession) -> str:
     song = session._current_song
     if song is None:
-        return "**Now spinning:** I’m lining up the set and opening a lane that fits your taste."
+        _intent = getattr(session, "prompt_intent", PromptIntent())
+        seed_hint = ""
+        if _intent.seed_artists:
+            seed_hint = f" around {', '.join(_intent.seed_artists[:2])}"
+        elif _intent.genres:
+            seed_hint = f" in {', '.join(_intent.genres[:2])}"
+        return (
+            f"**Setting up:** I’m searching for the right tracks{seed_hint}. "
+            "The first recommendation will appear shortly."
+        )
 
     intent = getattr(session, "prompt_intent", PromptIntent())
     tone_bits: list[str] = []
@@ -1738,9 +1748,105 @@ def prompt_artist_candidates(prompt: str) -> list[str]:
     return matches[:3]
 
 
+_ARTIST_DETECTION_STRIP_WORDS = {
+    "play", "give", "find", "put", "queue", "listen", "hear", "spin",
+    "drop", "start", "open", "begin", "make", "create", "build", "show",
+    "some", "me", "more", "less", "the", "a", "an", "with", "for", "to",
+    "of", "and", "but", "or", "just", "only", "that", "this", "its",
+    "i", "you", "we", "my", "your", "can", "please", "want", "need",
+    "really", "very", "super", "kinda", "kind", "sorta", "lot", "lots",
+    "something", "anything", "stuff", "thing", "things",
+    "music", "songs", "song", "tracks", "track", "vibes", "vibe",
+    "type", "style", "sound", "sounds", "beats", "beat", "tunes", "tune",
+    "playlist", "mix", "set", "session", "radio", "station", "album",
+    "similar", "inspired", "based", "around",
+    "funky", "groovy", "mellow", "soulful", "jazzy", "bluesy",
+    "poppy", "punky", "heavy", "light", "deep",
+    "slow", "fast", "uptempo", "downtempo",
+    "classic", "modern", "vintage", "retro", "contemporary",
+    "feel", "feeling", "mood", "energy",
+}
+
+
+def _artist_name_match(candidate: str, spotify_name: str) -> bool:
+    c = re.sub(r"[^a-z0-9 ]", "", candidate.lower()).strip()
+    s = re.sub(r"[^a-z0-9 ]", "", spotify_name.lower()).strip()
+    if not c or not s:
+        return False
+    if c == s:
+        return True
+    if c in s or s in c:
+        if len(c) >= max(3, int(len(s) * 0.6)):
+            return True
+    ratio = difflib.SequenceMatcher(None, c, s).ratio()
+    return ratio >= 0.82
+
+
+def _spotify_verify_artist(token: str, candidate: str) -> str | None:
+    if len(candidate) < 2:
+        return None
+    result = spotify_api_get(
+        "https://api.spotify.com/v1/search",
+        token,
+        {"q": candidate, "type": "artist", "limit": "5", "market": "US"},
+    )
+    for item in ((result or {}).get("artists", {}).get("items", []) or [])[:3]:
+        artist_name = str(item.get("name", "") or "")
+        if not artist_name:
+            continue
+        popularity = int(item.get("popularity", 0) or 0)
+        min_pop = 35 if " " not in candidate.strip() else 15
+        if _artist_name_match(candidate, artist_name) and popularity >= min_pop:
+            return artist_name
+    return None
+
+
+def detect_artists_via_spotify(prompt: str) -> list[str]:
+    """Detect artist names in a prompt by stripping known words and verifying via Spotify."""
+    token = spotify_user_token()
+    if not token:
+        return []
+    lowered = re.sub(r"[^\w\s]", " ", prompt.lower()).strip()
+    lowered = re.sub(r"\s+", " ", lowered)
+    strip_words = set(_ARTIST_DETECTION_STRIP_WORDS)
+    strip_words.update(m.lower() for m in KNOWN_MOODS)
+    strip_words.update(g.lower() for g in KNOWN_GENRES)
+    strip_words.update(k.lower() for k in GENRE_HINTS)
+    strip_words.update(v.lower() for v in GENRE_HINTS.values())
+    strip_words.update(k.lower() for k in MOOD_HINTS)
+    strip_words.update(v.lower() for v in MOOD_HINTS.values())
+    strip_words.update(f"{d}0s" for d in range(2, 10))
+    strip_words.update(f"19{d}0s" for d in range(2, 10))
+    strip_words.update(f"20{d}0s" for d in range(0, 4))
+
+    words = lowered.split()
+    remaining = [w for w in words if w not in strip_words and len(w) > 1]
+    if not remaining:
+        return []
+
+    candidate = " ".join(remaining)
+    if len(candidate) >= 3:
+        found = _spotify_verify_artist(token, candidate)
+        if found:
+            return [found]
+
+    if len(remaining) > 1:
+        for size in range(len(remaining) - 1, 0, -1):
+            for start in range(len(remaining) - size + 1):
+                chunk = " ".join(remaining[start : start + size])
+                if len(chunk) < 3:
+                    continue
+                found = _spotify_verify_artist(token, chunk)
+                if found:
+                    return [found]
+    return []
+
+
 def enrich_spec_from_prompt(prompt: str, spec: QuerySpec) -> QuerySpec:
     enriched = clone_spec(spec)
     artist_mentions = prompt_artist_candidates(prompt)
+    if not artist_mentions and not enriched.seed_artists:
+        artist_mentions = detect_artists_via_spotify(prompt)
     if artist_mentions:
         combined_artists: list[str] = []
         seen_artists: set[str] = set()
@@ -2775,6 +2881,60 @@ def liked_song_rail_items() -> list[dict[str, str]]:
     return items
 
 
+def _build_initial_session_with_fallback(
+    spec: QuerySpec,
+    playlist_length: int,
+    intent: PromptIntent,
+) -> tuple[DJSession, str | None, str]:
+    """Build the initial session with a bounded fallback ladder.
+
+    Returns ``(session, taste_note, relax_note)`` where *relax_note* describes
+    which relaxation stage produced the first viable pool.
+    """
+    wider_intent = PromptIntent(**vars(intent))
+    wider_intent.exploration_weight = min(0.96, float(intent.exploration_weight) + 0.12)
+    wider_intent.novelty_target = min(0.96, float(intent.novelty_target) + 0.12)
+    wider_intent.direct_match_weight = max(0.22, float(intent.direct_match_weight) - 0.08)
+
+    stages: list[tuple[QuerySpec, PromptIntent, str]] = [
+        (spec, intent, ""),
+    ]
+
+    if spec.constraints:
+        relaxed = clone_spec(spec)
+        relaxed.constraints = {}
+        relaxed.spotify_search_queries = relaxed.to_spotify_search_queries()
+        stages.append((relaxed, intent, ""))
+
+    if spec.genres and len(spec.genres) > 1:
+        relaxed = clone_spec(spec)
+        relaxed.genres = spec.genres[:1]
+        relaxed.constraints = {}
+        relaxed.spotify_search_queries = relaxed.to_spotify_search_queries()
+        stages.append((relaxed, wider_intent, ""))
+
+    if spec.genres or spec.constraints:
+        broad = clone_spec(spec)
+        broad.genres = []
+        broad.constraints = {}
+        broad.spotify_search_queries = broad.to_spotify_search_queries()
+        stages.append((broad, wider_intent, "I broadened the search to find enough tracks."))
+
+    for candidate_spec, candidate_intent, relax_note in stages:
+        session, taste_note = build_session_from_spec(
+            candidate_spec,
+            playlist_length,
+            prompt_intent=candidate_intent,
+            excluded_track_ids=set(),
+            excluded_track_signatures=set(),
+        )
+        if session._current_song is not None:
+            return session, taste_note, relax_note
+
+    ensure_current_song(session)
+    return session, taste_note, relax_note
+
+
 def start_session(prompt: str, playlist_length: int) -> None:
     spotify_note = sync_spotify_user_preferences()
     spec = enrich_spec_from_prompt(prompt, get_parser().parse(prompt))
@@ -2789,14 +2949,12 @@ def start_session(prompt: str, playlist_length: int) -> None:
     st.session_state["seen_track_signatures"] = set()
     st.session_state["completed_song_count"] = 0
     st.session_state["completed_song_keys"] = set()
-    session, taste_note = build_session_from_spec(
+    session, taste_note, _relax_note = _build_initial_session_with_fallback(
         spec,
         playlist_length,
-        prompt_intent=intent,
-        excluded_track_ids=set(),
-        excluded_track_signatures=set(),
+        intent,
     )
-    spec = session.spec  # use blended spec from build_session_from_spec
+    spec = session.spec
     st.session_state["dj_session"] = session
     st.session_state["session_finished"] = session._current_song is None
     st.session_state["last_feedback"] = None
@@ -2964,6 +3122,8 @@ def _build_refinement_with_fallback(
         (broad_spec, wider_intent, "I dropped the genre filter too so I could find enough tracks.")
     )
 
+    last_session = None
+    last_taste_note = None
     for candidate_spec, candidate_intent, relax_note in fallback_chain:
         session, taste_note = build_session_from_spec(
             candidate_spec,
@@ -2973,9 +3133,15 @@ def _build_refinement_with_fallback(
             excluded_track_ids=excluded_ids,
             excluded_track_signatures=excluded_sigs,
         )
-        count = getattr(session, "initial_candidate_count", session.pool.n_available)
-        if count > 0:
+        last_session = session
+        last_taste_note = taste_note
+        if session._current_song is not None:
             return session, taste_note, relax_note
+
+    if last_session is not None and last_session._current_song is None:
+        ensure_current_song(last_session)
+        if last_session._current_song is not None:
+            return last_session, last_taste_note, relax_note
 
     return None, None, ""
 
