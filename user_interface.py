@@ -30,7 +30,7 @@ except ModuleNotFoundError:
     go = Any
     HAS_PLOTLY = False
 
-from bayesian_dj.session import DJSession
+from bayesian_dj.session import DEFAULT_CSV, DJSession
 from bayesian_dj.discovery import (
     DEFAULT_DISCOVERY_WEIGHTS,
     discovery_score_frame,
@@ -79,6 +79,12 @@ UI_STATE_PATH = DATA_DIR / "ui_user_state.json"
 SPOTIFY_OAUTH_SCOPES = "user-top-read user-library-read user-library-modify user-read-recently-played"
 
 DATA_DIR.mkdir(exist_ok=True)
+
+
+@st.cache_data(show_spinner=False)
+def _load_catalog_df() -> pd.DataFrame:
+    """Load and cache the Kaggle CSV once per server process."""
+    return pd.read_csv(DEFAULT_CSV)
 
 US_HIT_GENRE_TOKENS = (
     "pop",
@@ -1318,67 +1324,46 @@ def build_session_from_spec(
     excluded_track_ids: set[str] | None = None,
     excluded_track_signatures: set[str] | None = None,
 ) -> tuple["DJSession", str | None]:
-    """Build a DJSession backed by a Spotify-fetched song pool.
+    """Build a DJSession backed by the local Kaggle CSV song catalog.
 
     Returns ``(session, taste_note)`` where *taste_note* is a human-readable
     string about taste-profile blending, or ``None``.
     """
-    token = spotify_user_token()
     profile = current_taste_profile()
 
-    songs_df = fetch_spotify_song_pool(token, spec, prompt_intent) if token else pd.DataFrame()
-
-    # Apply taste-profile blending against fetched songs
-    blended_spec = clone_spec(spec)
-    taste_note: str | None = None
-    if not songs_df.empty:
-        blended_spec, taste_note = apply_taste_profile(blended_spec, songs_df)
-
-    if songs_df.empty:
-        pool = SongPool.from_songs(pd.DataFrame())
-    else:
-        pool = SongPool.from_songs(songs_df)
-        pool.filter_by_genres(blended_spec.genres)
-        if pool.n_available == 0 and len(songs_df) > 0:
-            # Spotify genre labels can be sparse or imperfect. If the strict
-            # genre pass wipes everything out, fall back to the fetched pool
-            # instead of failing the session.
-            pool = SongPool.from_songs(songs_df)
-        pool.mark_used_track_ids(set(excluded_track_ids or set()))
-        pool.mark_used_track_signatures(set(excluded_track_signatures or set()))
-        pool.set_external_bias(
-            catalog_preference_scores(songs_df, profile, blended_spec, prompt_intent).to_numpy(dtype=float)
-        )
-
+    pool = SongPool.from_songs(_load_catalog_df())
     session = DJSession(
         csv_path=None,
         pool=pool,
         playlist_length=playlist_length,
         parser=get_parser(),
     )
+
+    # Apply taste-profile blending against the full catalog
+    blended_spec, taste_note = apply_taste_profile(clone_spec(spec), session.pool._df)
     session.spec = blended_spec
     session.prompt_intent = prompt_intent or PromptIntent()
+
+    session.pool.filter_by_genres(blended_spec.genres)
+
+    # Recover if genre filter left nothing (genre labels can be sparse/imperfect)
+    if session.pool.n_available == 0:
+        session.pool._available[:] = True
+
+    session.pool.mark_used_track_ids(set(excluded_track_ids or set()))
+    session.pool.mark_used_track_signatures(set(excluded_track_signatures or set()))
+    session.pool.set_external_bias(
+        catalog_preference_scores(session.pool._df, profile, blended_spec, prompt_intent).to_numpy(dtype=float)
+    )
+
     session.model = BayesianLogisticRegression.from_constraints(dict(session.spec.constraints))
 
-    # Warm-start the prior from the user's long-term top tracks first.
-    # If Spotify didn't give us enough of those, fall back to the strongest
-    # taste-profile matches in the current pool.
-    seeded_updates = 0
-    if not songs_df.empty and "_seed_all_time_rank" in pool._df.columns:
-        top_all_time = (
-            pool._df.loc[pool._df["_seed_all_time_rank"] >= 0]
-            .sort_values("_seed_all_time_rank")
-            .head(30)
-        )
-        for pool_idx in top_all_time.index.tolist():
-            session.model.update(spec_feature_vector(pool.get_song_info(int(pool_idx))), 1)
-            seeded_updates += 1
-
-    if seeded_updates < 20 and pool.n_available > 0:
-        feat_matrix = pool.get_feature_matrix()
-        bias_scores = pool.get_external_bias_scores()
+    # Warm-start the prior from the strongest taste-profile matches
+    if session.pool.n_available > 0:
+        feat_matrix = session.pool.get_feature_matrix()
+        bias_scores = session.pool.get_external_bias_scores()
         if len(bias_scores) > 0 and bias_scores.max() > 0:
-            top_local = np.argsort(bias_scores)[::-1][:min(30 - seeded_updates, len(bias_scores))]
+            top_local = np.argsort(bias_scores)[::-1][:30]
             for local_i in top_local:
                 session.model.update(feat_matrix[local_i], 1)
 
@@ -1434,9 +1419,9 @@ def _combined_pool_df(session: DJSession, extra_df: pd.DataFrame) -> pd.DataFram
 
 
 def replenish_session_pool(session: DJSession) -> bool:
-    if session is None or getattr(session, "_current_song", None) is not None:
-        return False
-    token = spotify_user_token()
+    # Pool is backed by the local CSV catalog which is large; no replenishment needed.
+    return False
+    token = spotify_user_token()  # noqa: F841 — kept for reference, not reached
     if not token or session.spec is None:
         return False
 
@@ -2450,6 +2435,7 @@ def spotify_api_request(
     method: str = "GET",
     params: dict[str, str] | None = None,
     body: dict[str, Any] | None = None,
+    _retries: int = 3,
 ) -> tuple[int | None, Any | None]:
     if params:
         url = f"{url}?{urllib_parse.urlencode(params)}"
@@ -2464,19 +2450,25 @@ def spotify_api_request(
         headers=headers,
         method=method,
     )
-    try:
-        with urllib_request.urlopen(request, timeout=20) as response:
-            raw = response.read().decode("utf-8")
-            return response.status, json.loads(raw) if raw else None
-    except urllib_error.HTTPError as exc:
-        raw = exc.read().decode("utf-8") if exc.fp is not None else ""
+    for attempt in range(max(1, _retries)):
         try:
-            parsed = json.loads(raw) if raw else None
-        except json.JSONDecodeError:
-            parsed = raw or None
-        return exc.code, parsed
-    except (urllib_error.URLError, TimeoutError):
-        return None, None
+            with urllib_request.urlopen(request, timeout=20) as response:
+                raw = response.read().decode("utf-8")
+                return response.status, json.loads(raw) if raw else None
+        except urllib_error.HTTPError as exc:
+            if exc.code == 429 and attempt < _retries - 1:
+                retry_after = int(exc.headers.get("Retry-After", "2") or "2")
+                time.sleep(min(retry_after, 30))
+                continue
+            raw = exc.read().decode("utf-8") if exc.fp is not None else ""
+            try:
+                parsed = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                parsed = raw or None
+            return exc.code, parsed
+        except (urllib_error.URLError, TimeoutError):
+            return None, None
+    return None, None
 
 
 def spotify_api_get(url: str, token: str, params: dict[str, str] | None = None) -> dict[str, Any] | None:
@@ -2574,18 +2566,30 @@ def sync_spotify_user_preferences(force: bool = False) -> str | None:
 
     token = spotify_user_token()
     if not token:
+        print("[sync] No Spotify token available — skipping sync.")
         return None
 
-    short_artists = spotify_api_get("https://api.spotify.com/v1/me/top/artists", token, {"limit": "15", "time_range": "short_term"})
-    medium_artists = spotify_api_get("https://api.spotify.com/v1/me/top/artists", token, {"limit": "20", "time_range": "medium_term"})
-    long_artists = spotify_api_get("https://api.spotify.com/v1/me/top/artists", token, {"limit": "20", "time_range": "long_term"})
-    short_tracks = spotify_api_get("https://api.spotify.com/v1/me/top/tracks", token, {"limit": "15", "time_range": "short_term"})
-    medium_tracks = spotify_api_get("https://api.spotify.com/v1/me/top/tracks", token, {"limit": "20", "time_range": "medium_term"})
-    long_tracks = spotify_api_get("https://api.spotify.com/v1/me/top/tracks", token, {"limit": "20", "time_range": "long_term"})
-    saved_tracks = spotify_paginated_items("https://api.spotify.com/v1/me/tracks", token, {"limit": "50"}, pages=10)
-    recent_tracks = spotify_paginated_items("https://api.spotify.com/v1/me/player/recently-played", token, {"limit": "50"}, pages=3)
+    def _debug_get(label: str, url: str, params: dict) -> dict | None:
+        status, payload = spotify_api_request(url, token, params=params)
+        if status == 200:
+            count = len((payload or {}).get("items", []))
+            print(f"[sync] {label}: OK ({count} items)")
+            return payload if isinstance(payload, dict) else None
+        print(f"[sync] {label}: FAILED status={status} body={str(payload)[:200]}")
+        return None
+
+    short_artists = _debug_get("top/artists short_term", "https://api.spotify.com/v1/me/top/artists", {"limit": "15", "time_range": "short_term"})
+    medium_artists = _debug_get("top/artists medium_term", "https://api.spotify.com/v1/me/top/artists", {"limit": "20", "time_range": "medium_term"})
+    long_artists = _debug_get("top/artists long_term", "https://api.spotify.com/v1/me/top/artists", {"limit": "20", "time_range": "long_term"})
+    short_tracks = _debug_get("top/tracks short_term", "https://api.spotify.com/v1/me/top/tracks", {"limit": "15", "time_range": "short_term"})
+    medium_tracks = _debug_get("top/tracks medium_term", "https://api.spotify.com/v1/me/top/tracks", {"limit": "20", "time_range": "medium_term"})
+    long_tracks = _debug_get("top/tracks long_term", "https://api.spotify.com/v1/me/top/tracks", {"limit": "20", "time_range": "long_term"})
+    saved_tracks = spotify_paginated_items("https://api.spotify.com/v1/me/tracks", token, {"limit": "50"}, pages=2)
+    recent_tracks = spotify_paginated_items("https://api.spotify.com/v1/me/player/recently-played", token, {"limit": "50"}, pages=1)
+    print(f"[sync] saved_tracks: {len(saved_tracks)} items  recent_tracks: {len(recent_tracks)} items")
 
     if not any((short_artists, medium_artists, long_artists, short_tracks, medium_tracks, long_tracks, saved_tracks, recent_tracks)):
+        print("[sync] All Spotify calls returned empty — sync aborted.")
         return None
 
     artist_weights: list[tuple[str, float]] = []
@@ -4094,7 +4098,7 @@ def plot_feature_profile(song):
 def render_weight_chart(session: DJSession) -> None:
     frame = weight_frame(session)
     if HAS_PLOTLY:
-        st.plotly_chart(plot_weight_view(session), width="stretch")
+        st.plotly_chart(plot_weight_view(session), use_container_width=True)
         return
 
     fallback = frame.set_index("feature")[["weight"]]
@@ -4105,7 +4109,7 @@ def render_weight_chart(session: DJSession) -> None:
 def render_entropy_chart(session: DJSession) -> None:
     frame = entropy_frame(session).set_index("step")
     if HAS_PLOTLY:
-        st.plotly_chart(plot_entropy_view(session), width="stretch")
+        st.plotly_chart(plot_entropy_view(session), use_container_width=True)
         return
 
     st.line_chart(frame[["entropy_delta"]], width="stretch")
@@ -4115,7 +4119,7 @@ def render_entropy_chart(session: DJSession) -> None:
 def render_prior_posterior_chart(session: DJSession) -> None:
     frame = prior_posterior_frame(session).set_index("feature")
     if HAS_PLOTLY:
-        st.plotly_chart(plot_prior_posterior_view(session), width="stretch")
+        st.plotly_chart(plot_prior_posterior_view(session), use_container_width=True)
         return
 
     st.bar_chart(frame[["Prior", "Posterior"]], width="stretch")
@@ -4124,7 +4128,7 @@ def render_prior_posterior_chart(session: DJSession) -> None:
 def render_shift_chart(session: DJSession) -> None:
     frame = prior_posterior_frame(session).set_index("feature")
     if HAS_PLOTLY:
-        st.plotly_chart(plot_shift_view(session), width="stretch")
+        st.plotly_chart(plot_shift_view(session), use_container_width=True)
         return
 
     st.bar_chart(frame[["Shift"]], width="stretch")
@@ -4133,7 +4137,7 @@ def render_shift_chart(session: DJSession) -> None:
 def render_feature_chart(song) -> None:
     frame = feature_profile_frame(song)
     if HAS_PLOTLY:
-        st.plotly_chart(plot_feature_profile(song), width="stretch")
+        st.plotly_chart(plot_feature_profile(song), use_container_width=True)
         return
 
     st.bar_chart(frame.set_index("feature")[["value"]], width="stretch")
@@ -4286,13 +4290,13 @@ def maybe_handle_auto_next(session: DJSession, song, playback_song) -> bool:
 
 
 def render_playback_area(song, art: dict[str, str | None]) -> None:
-    preview_url = art.get("preview_url")
     track_id = getattr(song, "track_id", "")
     defer_for_voice = "true" if st.session_state.get("speech_payload") else "false"
-    if preview_url:
+    if False:  # audio preview path disabled — use Spotify iframe embed for full playback
+        preview_url = art.get("preview_url")
         audio_markup = f"""
         <div class="playback-shell">
-            <audio id="bayes-player" src="{html.escape(preview_url)}" controls autoplay style="width:100%;"></audio>
+            <audio id="bayes-player" src="{html.escape(preview_url or '')}" controls autoplay style="width:100%;"></audio>
             <script>
                 const audio = document.getElementById("bayes-player");
                 {trigger_auto_next(track_id)}
